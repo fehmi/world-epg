@@ -1,0 +1,116 @@
+name: Daily worldwide EPG
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [automation.py, .github/workflows/guide.yml]
+  schedule:
+    - cron: '23 1 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: worldwide-epg
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      upstream: ${{ steps.revision.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: iptv-org/epg
+          path: upstream
+      - id: revision
+        run: echo "sha=$(git -C upstream rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - run: python3 automation.py plan
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan/
+          retention-days: 2
+
+  grab:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: iptv-org/epg
+          ref: ${{ needs.plan.outputs.upstream }}
+          path: upstream
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: upstream/package-lock.json
+      - run: npm ci
+        working-directory: upstream
+        env:
+          HUSKY: '0'
+      - run: python3 automation.py run --shard ${{ matrix.shard }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result-${{ matrix.shard }}
+          path: results/
+          retention-days: 2
+          if-no-files-found: warn
+
+  publish:
+    needs: [plan, grab]
+    if: ${{ always() && needs.plan.result == 'success' && !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: plan
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: result-*
+          merge-multiple: true
+          path: results
+      - uses: actions/configure-pages@v5
+        id: pages
+      - run: python3 automation.py publish
+        env:
+          PAGES_URL: ${{ steps.pages.outputs.base_url }}
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - uses: actions/deploy-pages@v4
+        id: deploy
+      - name: Record successful update and keep scheduled workflow active
+        run: |
+          cp public/status.json last-run.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add last-run.json
+          git commit -m 'Update EPG coverage report'
+          git push
